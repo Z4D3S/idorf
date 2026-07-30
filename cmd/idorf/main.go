@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/z4d3s/idorf/internal/analyzer"
+	"github.com/z4d3s/idorf/internal/detector"
 	"github.com/z4d3s/idorf/internal/fuzzer"
 	"github.com/z4d3s/idorf/internal/multisession"
+	"github.com/z4d3s/idorf/internal/mutator"
 	"github.com/z4d3s/idorf/internal/parser"
 	"github.com/z4d3s/idorf/internal/proxy"
 	"github.com/z4d3s/idorf/internal/reporter"
@@ -38,11 +40,12 @@ var (
 	usersFile    string
 	proxyMode    bool
 	proxyListen  string
+	autoDetect   bool
 	verbose      bool
 	showVersion  bool
 )
 
-const version = "0.3.0"
+const version = "0.5.0"
 
 func main() {
 	flag.StringVar(&curlCmd, "c", "", "cURL command to use as request template")
@@ -61,6 +64,7 @@ func main() {
 	flag.StringVar(&usersFile, "users-file", "", "Multi-session: JSON file with user sessions")
 	flag.BoolVar(&proxyMode, "proxy-mode", false, "Start proxy mode for live traffic capture and replay")
 	flag.StringVar(&proxyListen, "proxy-listen", "127.0.0.1:8081", "Proxy listen address (default 127.0.0.1:8081)")
+	flag.BoolVar(&autoDetect, "auto", false, "Auto-detect IDs in the request and generate mutations")
 	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
 
@@ -139,10 +143,14 @@ func main() {
 		return
 	}
 
-	if wordlistFile == "" {
+	if wordlistFile == "" && !autoDetect {
 		fmt.Fprintln(os.Stderr, "Error: -w (wordlist file) is required")
 		flag.Usage()
 		os.Exit(1)
+	}
+	if autoDetect && wordlistFile != "" {
+		fmt.Println("[+] Using provided wordlist (--auto ignored for wordlist)")
+		autoDetect = false
 	}
 
 	// 1. Parse request
@@ -166,15 +174,54 @@ func main() {
 	fmt.Printf("\n[+] Target: %s %s\n", req.Method, req.URL)
 	fmt.Printf("[+] Marker: %s\n", marker)
 
-	// 2. Check marker present (skip for multi-session without marker)
+	// 2. Check marker present (skip for multi-session or auto-detect)
 	isMultiSession := usersFlag != "" || usersFile != ""
-	if !isMultiSession && !req.ContainsMarker(marker) {
+	if !isMultiSession && !autoDetect && !req.ContainsMarker(marker) {
 		fmt.Fprintf(os.Stderr, "\n[!] Warning: marker '%s' not found in request\n", marker)
-		fmt.Fprintf(os.Stderr, "    Use -m to specify a different marker or --users for multi-session mode\n")
+		fmt.Fprintf(os.Stderr, "    Use -m to specify a different marker, --users for multi-session, or --auto for auto-detection\n")
 		os.Exit(1)
 	}
 	if isMultiSession && !req.ContainsMarker(marker) {
 		fmt.Printf("[+] Multi-session mode (no marker — replaying same request with N users)\n")
+	}
+
+	// 2b. Auto-detect IDs
+	if autoDetect {
+		detected := detector.Detect(req.URL, req.Body)
+		fmt.Printf("[+] Auto-detect: found %d IDs\n", len(detected.IDs))
+		for _, id := range detected.IDs {
+			fmt.Printf("    %s: %s (%s) at %s\n", id.Type, id.Value, id.Location, id.Path)
+		}
+
+		if len(detected.IDs) > 0 {
+			// Generate mutations
+			mutations := mutator.MutateAll(detected.IDs, mutator.DefaultConfig())
+			fmt.Printf("[+] Auto-detect: generated %d mutations\n", len(mutations))
+
+			// If no wordlist provided, use mutations as wordlist
+			if wordlistFile == "" && len(mutations) > 0 {
+				tmpFile, err := os.CreateTemp("", "idorf-mutations-*.txt")
+				if err != nil {
+					fatal("creating temp file: %v", err)
+				}
+				for _, m := range mutations {
+					fmt.Fprintln(tmpFile, m)
+				}
+				tmpFile.Close()
+				wordlistFile = tmpFile.Name()
+
+				// Replace the first detected ID with FUZZ marker in the request
+				if !req.ContainsMarker(marker) {
+					firstID := detected.IDs[0]
+					req.URL = strings.Replace(req.URL, firstID.Value, marker, 1)
+					req.Body = strings.ReplaceAll(req.Body, firstID.Value, marker)
+				}
+			}
+		} else if wordlistFile == "" {
+			fmt.Fprintf(os.Stderr, "\n[!] No IDs detected and no wordlist provided.\n")
+			fmt.Fprintf(os.Stderr, "    Provide a wordlist with -w or check the request for ID patterns.\n")
+			os.Exit(1)
+		}
 	}
 
 	// 3. Load wordlist
