@@ -22,33 +22,21 @@ type Report struct {
 	Total      int             `json:"total"`
 	Vulnerable int             `json:"vulnerable"`
 	Safe       int             `json:"safe"`
+	Errors     int             `json:"errors"`
 	Results    []fuzzer.Result `json:"results"`
 }
 
-// Generate creates a report in the specified format.
+// Generate creates a JSON report and writes it to the specified file.
 func Generate(results []fuzzer.Result, target string, cfg *Config) error {
+	stats := fuzzer.ComputeStats(results)
+
 	report := Report{
-		Target:  target,
-		Total:   len(results),
-		Results: results,
-	}
-
-	for _, r := range results {
-		if r.Analysis.IsVulnerable {
-			report.Vulnerable++
-		} else {
-			report.Safe++
-		}
-	}
-
-	output := os.Stdout
-	if cfg.OutputFile != "" {
-		f, err := os.Create(cfg.OutputFile)
-		if err != nil {
-			return fmt.Errorf("creating output file: %w", err)
-		}
-		defer f.Close()
-		output = f
+		Target:     target,
+		Total:      len(results),
+		Vulnerable: stats.Vulnerable,
+		Safe:       stats.Safe,
+		Errors:     stats.Errors,
+		Results:    results,
 	}
 
 	data, err := json.MarshalIndent(report, "", "  ")
@@ -56,27 +44,89 @@ func Generate(results []fuzzer.Result, target string, cfg *Config) error {
 		return fmt.Errorf("marshaling report: %w", err)
 	}
 
-	if _, err := output.Write(data); err != nil {
+	if cfg.OutputFile == "" || cfg.OutputFile == "stdout" {
+		fmt.Println(string(data))
+		return nil
+	}
+
+	if err := os.WriteFile(cfg.OutputFile, data, 0644); err != nil {
 		return fmt.Errorf("writing report: %w", err)
 	}
 
 	return nil
 }
 
-// PrintTerminal prints a human-readable summary to the terminal.
+// PrintTerminal prints a human-readable summary to the terminal with colors.
 func PrintTerminal(results []fuzzer.Result) {
-	var vulnCount, safeCount int
+	if len(results) == 0 {
+		fmt.Println("No results.")
+		return
+	}
+
+	var vulnResults, safeResults, errorResults []fuzzer.Result
+
 	for _, r := range results {
-		if r.Analysis.IsVulnerable {
-			vulnCount++
-			fmt.Printf("🚨 %s -> Status: %d, Size: %d [%s] %s\n",
-				r.Value, r.Status, r.Size, r.Analysis.Confidence, r.Analysis.Reason)
-		} else {
-			safeCount++
+		switch {
+		case r.Error != "":
+			errorResults = append(errorResults, r)
+		case r.Analysis.IsVulnerable:
+			vulnResults = append(vulnResults, r)
+		default:
+			safeResults = append(safeResults, r)
 		}
 	}
 
-	fmt.Println(strings.Repeat("-", 50))
-	fmt.Printf("Total: %d | 🚨 Vulnerable: %d | 🟢 Safe: %d\n",
-		len(results), vulnCount, safeCount)
+	// Print vulnerable results first (most important)
+	if len(vulnResults) > 0 {
+		fmt.Println("── POTENTIAL VULNERABILITIES ──────────────────")
+		for _, r := range vulnResults {
+			emoji := "🔴"
+			if r.Analysis.Confidence == "critical" {
+				emoji = "🚨"
+			}
+			fmt.Printf("%s [%s] %-20s → HTTP %d, %d bytes\n",
+				emoji, strings.ToUpper(r.Analysis.Confidence),
+				r.Value, r.Status, r.Size)
+			fmt.Printf("   Reason: %s\n", r.Analysis.Reason)
+			if len(r.Body) < 500 && r.Body != "" {
+				fmt.Printf("   Body: %s\n", r.Body)
+			}
+			fmt.Println()
+		}
+	}
+
+	// Print errors
+	if len(errorResults) > 0 {
+		fmt.Println("── ERRORS ─────────────────────────────────────")
+		for _, r := range errorResults {
+			fmt.Printf("⚠️  %-20s → Error: %s\n", r.Value, r.Error)
+		}
+		fmt.Println()
+	}
+
+	// Print safe results (brief)
+	if len(safeResults) > 0 && len(safeResults) <= 20 {
+		fmt.Println("── SAFE ───────────────────────────────────────")
+		for _, r := range safeResults {
+			fmt.Printf("🟢 %-20s → HTTP %d, %d bytes\n", r.Value, r.Status, r.Size)
+		}
+		fmt.Println()
+	}
+
+	// Summary
+	fmt.Println("═══════════════════════════════════════════════")
+	vulnCount := len(vulnResults)
+	safeCount := len(safeResults)
+	errCount := len(errorResults)
+	total := len(results)
+
+	status := "✅ No vulnerabilities found"
+	if vulnCount > 0 {
+		status = "🚨 POTENTIAL IDOR DETECTED"
+	}
+
+	fmt.Printf("Total: %d | 🚨 Vulnerable: %d | 🟢 Safe: %d | ⚠️  Errors: %d\n",
+		total, vulnCount, safeCount, errCount)
+	fmt.Printf("Status: %s\n", status)
+	fmt.Println("═══════════════════════════════════════════════")
 }
