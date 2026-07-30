@@ -6,14 +6,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/z4d3s/idorf/internal/analyzer"
 	"github.com/z4d3s/idorf/internal/fuzzer"
 	"github.com/z4d3s/idorf/internal/multisession"
 	"github.com/z4d3s/idorf/internal/parser"
+	"github.com/z4d3s/idorf/internal/proxy"
 	"github.com/z4d3s/idorf/internal/reporter"
 	"github.com/z4d3s/idorf/internal/session"
 )
@@ -33,6 +36,8 @@ var (
 	knownIDs     string
 	usersFlag    string
 	usersFile    string
+	proxyMode    bool
+	proxyListen  string
 	verbose      bool
 	showVersion  bool
 )
@@ -54,6 +59,8 @@ func main() {
 	flag.StringVar(&knownIDs, "known-ids", "", "Comma-separated IDs that are known-safe (used as baseline)")
 	flag.StringVar(&usersFlag, "users", "", "Multi-session: name:token pairs (e.g. 'admin:Bearer x,user1:Bearer y,anon:')")
 	flag.StringVar(&usersFile, "users-file", "", "Multi-session: JSON file with user sessions")
+	flag.BoolVar(&proxyMode, "proxy-mode", false, "Start proxy mode for live traffic capture and replay")
+	flag.StringVar(&proxyListen, "proxy-listen", "127.0.0.1:8081", "Proxy listen address (default 127.0.0.1:8081)")
 	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
 
@@ -82,10 +89,54 @@ func main() {
 		os.Exit(0)
 	}
 
-	if curlCmd == "" && requestFile == "" {
-		fmt.Fprintln(os.Stderr, "Error: either -c (curl) or -r (request file) is required")
-		flag.Usage()
-		os.Exit(1)
+	// -- Proxy mode (starts before any -c/-r validation) --
+	if proxyMode {
+		if usersFlag == "" && usersFile == "" {
+			fatal("proxy mode requires --users or --users-file")
+		}
+		if usersFlag == "" && usersFile == "" {
+			fatal("proxy mode requires --users or --users-file")
+		}
+
+		var mgr *multisession.Manager
+		var err error
+		if usersFile != "" {
+			mgr, err = multisession.LoadUsersFromFile(usersFile)
+		} else {
+			mgr, err = multisession.ParseUsersFlag(usersFlag)
+		}
+		if err != nil {
+			fatal("loading users: %v", err)
+		}
+
+		p := proxy.New(proxy.Config{
+			ListenAddr:  proxyListen,
+			Manager:     mgr,
+			DiffPattern: diffPattern,
+			Verbose:     verbose,
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Handle Ctrl+C
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			fmt.Println("\n[+] Stopping proxy...")
+			cancel()
+			p.Stop(context.Background())
+		}()
+
+		if err := p.Start(ctx); err != nil {
+			fatal("proxy error: %v", err)
+		}
+
+		// Print summary
+		results := p.GetResults()
+		proxy.PrintSummary(results)
+		return
 	}
 
 	if wordlistFile == "" {
