@@ -130,3 +130,106 @@ func PrintTerminal(results []fuzzer.Result) {
 	fmt.Printf("Status: %s\n", status)
 	fmt.Println("═══════════════════════════════════════════════")
 }
+
+// PrintMultiTerminal prints results for multi-session mode.
+func PrintMultiTerminal(results []fuzzer.MultiResult) {
+	if len(results) == 0 {
+		fmt.Println("No results.")
+		return
+	}
+
+	var vulnResults, safeResults []fuzzer.MultiResult
+	for _, r := range results {
+		if r.IsVulnerable {
+			vulnResults = append(vulnResults, r)
+		} else {
+			safeResults = append(safeResults, r)
+		}
+	}
+
+	// Print vulnerable results
+	if len(vulnResults) > 0 {
+		fmt.Println("── ACCESS CONTROL DIFFERENCES ──────────────────")
+		for _, r := range vulnResults {
+			emoji := "🔴"
+			if r.Confidence == "critical" {
+				emoji = "🚨"
+			}
+			fmt.Printf("%s [%s] ID: %-15s\n", emoji, strings.ToUpper(r.Confidence), r.Value)
+			fmt.Printf("   Reason: %s\n", r.Reason)
+
+			// Show per-user status
+			for user, status := range r.Responses {
+				size := r.BodySizes[user]
+				fmt.Printf("   %-10s HTTP %d, %d bytes\n", user+":", status, size)
+			}
+
+			// Show diff details for first vulnerable comparison
+			for _, comp := range r.Comparisons {
+				if comp.IsVulnerable {
+					fmt.Printf("   Diff %s vs %s: %s\n", comp.UserA, comp.UserB, comp.DiffResult.Summary)
+					break
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	// Print safe results (brief)
+	if len(safeResults) > 0 && len(safeResults) <= 20 {
+		fmt.Println("── NO DIFFERENCES ────────────────────────────────")
+		for _, r := range safeResults {
+			fmt.Printf("🟢 ID: %-15s — same access for all users\n", r.Value)
+		}
+		fmt.Println()
+	}
+
+	// Summary
+	fmt.Println("═══════════════════════════════════════════════")
+	fmt.Printf("Total: %d | 🚨 Vulnerable: %d | 🟢 Safe: %d\n",
+		len(results), len(vulnResults), len(safeResults))
+	if len(vulnResults) > 0 {
+		fmt.Println("Status: 🚨 ACCESS CONTROL ISSUES DETECTED")
+	} else {
+		fmt.Println("Status: ✅ No access control differences found")
+	}
+	fmt.Println("═══════════════════════════════════════════════")
+}
+
+// GenerateMulti creates a JSON report for multi-session results.
+func GenerateMulti(results []fuzzer.MultiResult, target string, cfg *Config) error {
+	type multiReport struct {
+		Target     string               `json:"target"`
+		Total      int                  `json:"total"`
+		Vulnerable int                  `json:"vulnerable"`
+		Safe       int                  `json:"safe"`
+		Results    []fuzzer.MultiResult `json:"results"`
+	}
+
+	vulnCount := 0
+	for _, r := range results {
+		if r.IsVulnerable {
+			vulnCount++
+		}
+	}
+
+	report := multiReport{
+		Target:     target,
+		Total:      len(results),
+		Vulnerable: vulnCount,
+		Safe:       len(results) - vulnCount,
+		Results:    results,
+	}
+
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling report: %w", err)
+	}
+
+	if cfg.OutputFile == "" || cfg.OutputFile == "stdout" {
+		fmt.Println(string(data))
+		return nil
+	}
+
+	return os.WriteFile(cfg.OutputFile, data, 0644)
+}

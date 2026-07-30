@@ -12,6 +12,7 @@ import (
 
 	"github.com/z4d3s/idorf/internal/analyzer"
 	"github.com/z4d3s/idorf/internal/fuzzer"
+	"github.com/z4d3s/idorf/internal/multisession"
 	"github.com/z4d3s/idorf/internal/parser"
 	"github.com/z4d3s/idorf/internal/reporter"
 	"github.com/z4d3s/idorf/internal/session"
@@ -30,11 +31,13 @@ var (
 	proxyURL     string
 	diffPattern  string
 	knownIDs     string
+	usersFlag    string
+	usersFile    string
 	verbose      bool
 	showVersion  bool
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	flag.StringVar(&curlCmd, "c", "", "cURL command to use as request template")
@@ -49,6 +52,8 @@ func main() {
 	flag.StringVar(&proxyURL, "proxy", "", "Proxy URL (e.g. http://127.0.0.1:8080)")
 	flag.StringVar(&diffPattern, "diff-pattern", "", "Custom regex for sensitive data detection (e.g. 'credit_card|api_key')")
 	flag.StringVar(&knownIDs, "known-ids", "", "Comma-separated IDs that are known-safe (used as baseline)")
+	flag.StringVar(&usersFlag, "users", "", "Multi-session: name:token pairs (e.g. 'admin:Bearer x,user1:Bearer y,anon:')")
+	flag.StringVar(&usersFile, "users-file", "", "Multi-session: JSON file with user sessions")
 	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
 
@@ -110,11 +115,15 @@ func main() {
 	fmt.Printf("\n[+] Target: %s %s\n", req.Method, req.URL)
 	fmt.Printf("[+] Marker: %s\n", marker)
 
-	// 2. Check marker present
-	if !req.ContainsMarker(marker) {
+	// 2. Check marker present (skip for multi-session without marker)
+	isMultiSession := usersFlag != "" || usersFile != ""
+	if !isMultiSession && !req.ContainsMarker(marker) {
 		fmt.Fprintf(os.Stderr, "\n[!] Warning: marker '%s' not found in request\n", marker)
-		fmt.Fprintf(os.Stderr, "    Use -m to specify a different marker\n")
+		fmt.Fprintf(os.Stderr, "    Use -m to specify a different marker or --users for multi-session mode\n")
 		os.Exit(1)
+	}
+	if isMultiSession && !req.ContainsMarker(marker) {
+		fmt.Printf("[+] Multi-session mode (no marker — replaying same request with N users)\n")
 	}
 
 	// 3. Load wordlist
@@ -172,87 +181,132 @@ func main() {
 	}
 	fmt.Println()
 
-	// 8. Run fuzzer
+	// 8. Run fuzzer — single or multi-session
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(values)*timeout+30)*time.Second)
 	defer cancel()
 
-	results, err := fuzzer.Run(ctx, req, values, sess, cfg)
-	if err != nil {
-		fatal("fuzzing failed: %v", err)
-	}
-
-	// 9. Build baselines from known IDs
-	var baselines []analyzer.Baseline
-	if len(knownIDSet) > 0 {
-		for _, r := range results {
-			if knownIDSet[r.Value] && r.Error == "" {
-				baselines = append(baselines, analyzer.Baseline{
-					ID:     r.Value,
-					Status: r.Status,
-					Size:   r.Size,
-					Body:   r.Body,
-				})
+	if usersFlag != "" || usersFile != "" {
+		// Multi-session mode
+		var mgr *multisession.Manager
+		if usersFile != "" {
+			mgr, err = multisession.LoadUsersFromFile(usersFile)
+			if err != nil {
+				fatal("loading users file: %v", err)
+			}
+		} else {
+			mgr, err = multisession.ParseUsersFlag(usersFlag)
+			if err != nil {
+				fatal("parsing users flag: %v", err)
 			}
 		}
-	}
+		fmt.Printf("[+] Multi-session: %d users (%s)\n", mgr.GetUserCount(), strings.Join(mgr.GetUserNames(), ", "))
+		fmt.Println()
 
-	// 10. Analyze results
-	if len(baselines) > 0 {
-		for i := range results {
-			if results[i].Error == "" && !knownIDSet[results[i].Value] {
-				results[i].Analysis = analyzer.AnalyzeWithBaselines(
-					results[i].Status, results[i].Size, results[i].Body,
-					baselines, customPattern,
-				)
-			} else if knownIDSet[results[i].Value] {
-				results[i].Analysis = analyzer.Result{
-					IsVulnerable: false,
-					Confidence:   "safe",
-					Reason:       "known-safe ID (baseline)",
-				}
+		multiResults, err := fuzzer.RunMulti(ctx, req, values, mgr, cfg)
+		if err != nil {
+			fatal("multi-session fuzzing failed: %v", err)
+		}
+
+		reporter.PrintMultiTerminal(multiResults)
+
+		if outputFile != "" {
+			if err := reporter.GenerateMulti(multiResults, req.URL, &reporter.Config{
+				OutputFile: outputFile,
+				Verbose:    verbose,
+			}); err != nil {
+				fatal("saving report: %v", err)
 			}
+			fmt.Printf("\n[+] Report saved to %s\n", outputFile)
+		}
+
+		vulnCount := 0
+		for _, r := range multiResults {
+			if r.IsVulnerable {
+				vulnCount++
+			}
+		}
+		if vulnCount > 0 {
+			os.Exit(1)
 		}
 	} else {
-		// Use first result as baseline
-		if len(results) > 0 {
-			bl := results[0]
-			for i := range results {
-				if results[i].Error == "" {
-					results[i].Analysis = analyzer.Analyze(
-						bl.Status, bl.Size, bl.Body,
-						results[i].Status, results[i].Size, results[i].Body,
-						customPattern,
-					)
+		// Single-session mode
+		results, err := fuzzer.Run(ctx, req, values, sess, cfg)
+		if err != nil {
+			fatal("fuzzing failed: %v", err)
+		}
+
+		// 9. Build baselines from known IDs
+		var baselines []analyzer.Baseline
+		if len(knownIDSet) > 0 {
+			for _, r := range results {
+				if knownIDSet[r.Value] && r.Error == "" {
+					baselines = append(baselines, analyzer.Baseline{
+						ID:     r.Value,
+						Status: r.Status,
+						Size:   r.Size,
+						Body:   r.Body,
+					})
 				}
 			}
 		}
-	}
 
-	// 11. Report
-	reporter.PrintTerminal(results)
-
-	// 12. Save JSON if requested
-	if outputFile != "" {
-		if err := reporter.Generate(results, req.URL, &reporter.Config{
-			OutputFile: outputFile,
-			Verbose:    verbose,
-		}); err != nil {
-			fatal("saving report: %v", err)
+		// 10. Analyze results
+		if len(baselines) > 0 {
+			for i := range results {
+				if results[i].Error == "" && !knownIDSet[results[i].Value] {
+					results[i].Analysis = analyzer.AnalyzeWithBaselines(
+						results[i].Status, results[i].Size, results[i].Body,
+						baselines, customPattern,
+					)
+				} else if knownIDSet[results[i].Value] {
+					results[i].Analysis = analyzer.Result{
+						IsVulnerable: false,
+						Confidence:   "safe",
+						Reason:       "known-safe ID (baseline)",
+					}
+				}
+			}
+		} else {
+			if len(results) > 0 {
+				bl := results[0]
+				for i := range results {
+					if results[i].Error == "" {
+						results[i].Analysis = analyzer.Analyze(
+							bl.Status, bl.Size, bl.Body,
+							results[i].Status, results[i].Size, results[i].Body,
+							customPattern,
+						)
+					}
+				}
+			}
 		}
-		fmt.Printf("\n[+] Report saved to %s\n", outputFile)
-	}
 
-	// 13. Save session if it changed
-	if sessionFile != "" {
-		if err := sess.Save(sessionFile); err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Warning: could not save session: %v\n", err)
+		// 11. Report
+		reporter.PrintTerminal(results)
+
+		// 12. Save JSON if requested
+		if outputFile != "" {
+			if err := reporter.Generate(results, req.URL, &reporter.Config{
+				OutputFile: outputFile,
+				Verbose:    verbose,
+			}); err != nil {
+				fatal("saving report: %v", err)
+			}
+			fmt.Printf("\n[+] Report saved to %s\n", outputFile)
 		}
-	}
 
-	// Exit code: 1 if vulnerabilities found
-	stats := fuzzer.ComputeStats(results)
-	if stats.Vulnerable > 0 {
-		os.Exit(1)
+		// 13. Save session if it changed
+		if sessionFile != "" {
+			if err := sess.Save(sessionFile); err != nil {
+				fmt.Fprintf(os.Stderr, "[!] Warning: could not save session: %v\n", err)
+			}
+		}
+
+		// Exit code: 1 if vulnerabilities found
+		stats := fuzzer.ComputeStats(results)
+		if stats.Vulnerable > 0 {
+			os.Exit(1)
+		}
 	}
 }
 

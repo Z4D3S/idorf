@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/z4d3s/idorf/internal/analyzer"
+	"github.com/z4d3s/idorf/internal/multisession"
 	"github.com/z4d3s/idorf/internal/parser"
 	"github.com/z4d3s/idorf/internal/session"
 )
@@ -229,4 +230,144 @@ func ComputeStats(results []Result) Stats {
 		}
 	}
 	return stats
+}
+
+// MultiResult holds results for a single fuzzed value across all users.
+type MultiResult struct {
+	Value        string                          `json:"value"`
+	Responses    map[string]int                  `json:"responses"`
+	BodySizes    map[string]int                  `json:"body_sizes"`
+	Bodies       map[string]string               `json:"bodies"`
+	Comparisons  []multisession.ComparisonResult `json:"comparisons"`
+	IsVulnerable bool                            `json:"is_vulnerable"`
+	Confidence   string                          `json:"confidence"`
+	Reason       string                          `json:"reason"`
+}
+
+type multiJob struct {
+	value string
+}
+
+// RunMulti executes the fuzzing campaign with multiple user sessions.
+// For each fuzzed value, the request is sent with each user's session.
+// Responses are compared across users to detect access control differences.
+// If the base request has no FUZZ marker, the wordlist is ignored (sends once per user).
+func RunMulti(ctx context.Context, baseReq *parser.Request, values []string, mgr *multisession.Manager, cfg *Config) ([]MultiResult, error) {
+	if baseReq == nil {
+		return nil, fmt.Errorf("nil base request")
+	}
+	if cfg.Threads < 1 {
+		cfg.Threads = 1
+	}
+
+	hasMarker := baseReq.ContainsMarker("FUZZ")
+	if !hasMarker {
+		values = []string{""}
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("no values to fuzz")
+	}
+
+	client := buildHTTPClient(cfg)
+
+	jobs := make(chan multiJob, len(values))
+	results := make(chan MultiResult, len(values))
+	var wg sync.WaitGroup
+
+	for i := 0; i < cfg.Threads; i++ {
+		wg.Add(1)
+		go multiWorker(ctx, jobs, results, baseReq, mgr, cfg, client, &wg)
+	}
+
+	for _, v := range values {
+		jobs <- multiJob{value: v}
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var allResults []MultiResult
+	for r := range results {
+		allResults = append(allResults, r)
+	}
+
+	return allResults, nil
+}
+
+func multiWorker(ctx context.Context, jobs <-chan multiJob, results chan<- MultiResult, baseReq *parser.Request, mgr *multisession.Manager, cfg *Config, client *http.Client, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	userNames := mgr.GetUserNames()
+	hasMarker := baseReq.ContainsMarker("FUZZ")
+
+	for j := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+
+		value := j.value
+		responses := make(map[string]int)
+		bodies := make(map[string]string)
+
+		for _, userName := range userNames {
+			userSess := mgr.GetUserSession(userName)
+			if userSess == nil {
+				continue
+			}
+
+			fuzzed := baseReq.Clone()
+			if hasMarker {
+				fuzzed.ReplaceMarker("FUZZ", value)
+			}
+			// Replace the base request auth with this user's auth
+			// Clear existing Authorization then apply user's headers
+			delete(fuzzed.Headers, "Authorization")
+			delete(fuzzed.Headers, "Cookie")
+			userSess.ApplyHeaders(fuzzed.Headers)
+			cookieHeader := userSess.ToCookieHeader()
+			if cookieHeader != "" {
+				fuzzed.Headers["Cookie"] = cookieHeader
+			}
+
+			bodyReader := strings.NewReader(fuzzed.Body)
+			req, err := http.NewRequestWithContext(ctx, fuzzed.Method, fuzzed.URL, bodyReader)
+			if err != nil {
+				responses[userName] = 0
+				bodies[userName] = ""
+				continue
+			}
+
+			for k, v := range fuzzed.Headers {
+				req.Header.Set(k, v)
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				responses[userName] = 0
+				bodies[userName] = ""
+				continue
+			}
+
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			responses[userName] = resp.StatusCode
+			bodies[userName] = string(bodyBytes)
+		}
+
+		result := mgr.BuildMultiResult(value, responses, bodies)
+		results <- MultiResult{
+			Value:        result.Value,
+			Responses:    result.Responses,
+			BodySizes:    result.BodySizes,
+			Bodies:       result.Bodies,
+			Comparisons:  result.Comparisons,
+			IsVulnerable: result.IsVulnerable,
+			Confidence:   result.Confidence,
+			Reason:       result.Reason,
+		}
+	}
 }
