@@ -15,6 +15,7 @@ import (
 	"github.com/z4d3s/idorf/internal/analyzer"
 	"github.com/z4d3s/idorf/internal/detector"
 	"github.com/z4d3s/idorf/internal/fuzzer"
+	"github.com/z4d3s/idorf/internal/har"
 	"github.com/z4d3s/idorf/internal/multisession"
 	"github.com/z4d3s/idorf/internal/mutator"
 	"github.com/z4d3s/idorf/internal/parser"
@@ -24,25 +25,27 @@ import (
 )
 
 var (
-	curlCmd      string
-	requestFile  string
-	wordlistFile string
-	marker       string
-	sessionFile  string
-	outputFile   string
-	threads      int
-	rateLimit    int
-	timeout      int
-	proxyURL     string
-	diffPattern  string
-	knownIDs     string
-	usersFlag    string
-	usersFile    string
-	proxyMode    bool
-	proxyListen  string
-	autoDetect   bool
-	verbose      bool
-	showVersion  bool
+	curlCmd       string
+	requestFile   string
+	wordlistFile  string
+	marker        string
+	sessionFile   string
+	outputFile    string
+	threads       int
+	rateLimit     int
+	timeout       int
+	proxyURL      string
+	diffPattern   string
+	knownIDs      string
+	usersFlag     string
+	usersFile     string
+	proxyMode     bool
+	proxyListen   string
+	harFile       string
+	includeStatic bool
+	autoDetect    bool
+	verbose       bool
+	showVersion   bool
 )
 
 const version = "0.5.0"
@@ -64,6 +67,8 @@ func main() {
 	flag.StringVar(&usersFile, "users-file", "", "Multi-session: JSON file with user sessions")
 	flag.BoolVar(&proxyMode, "proxy-mode", false, "Start proxy mode for live traffic capture and replay")
 	flag.StringVar(&proxyListen, "proxy-listen", "127.0.0.1:8081", "Proxy listen address (default 127.0.0.1:8081)")
+	flag.StringVar(&harFile, "har", "", "HAR file to import and replay (use with --users)")
+	flag.BoolVar(&includeStatic, "include-static", false, "Include static requests (images, CSS, JS) in HAR import")
 	flag.BoolVar(&autoDetect, "auto", false, "Auto-detect IDs in the request and generate mutations")
 	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
@@ -95,9 +100,6 @@ func main() {
 
 	// -- Proxy mode (starts before any -c/-r validation) --
 	if proxyMode {
-		if usersFlag == "" && usersFile == "" {
-			fatal("proxy mode requires --users or --users-file")
-		}
 		if usersFlag == "" && usersFile == "" {
 			fatal("proxy mode requires --users or --users-file")
 		}
@@ -140,6 +142,24 @@ func main() {
 		// Print summary
 		results := p.GetResults()
 		proxy.PrintSummary(results)
+		return
+	}
+
+	// -- HAR import mode --
+	if harFile != "" {
+		requests, err := har.ImportRequests(harFile, includeStatic)
+		if err != nil {
+			fatal("importing HAR: %v", err)
+		}
+		fmt.Printf("[+] HAR: %d requests imported from %s\n", len(requests), harFile)
+
+		if usersFlag != "" || usersFile != "" {
+			runMultiSessionHAR(requests)
+		} else {
+			// Single-session: just run each request
+			fmt.Fprintf(os.Stderr, "[!] HAR mode works best with --users for multi-session comparison\n")
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -434,4 +454,61 @@ func loadWordlist(path string) ([]string, error) {
 func fatal(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[!] Error: "+format+"\n", args...)
 	os.Exit(2)
+}
+
+func runMultiSessionHAR(requests []*parser.Request) {
+	var mgr *multisession.Manager
+	var err error
+	if usersFile != "" {
+		mgr, err = multisession.LoadUsersFromFile(usersFile)
+	} else {
+		mgr, err = multisession.ParseUsersFlag(usersFlag)
+	}
+	if err != nil {
+		fatal("loading users: %v", err)
+	}
+
+	cfg := &fuzzer.Config{
+		Threads:   threads,
+		RateLimit: rateLimit,
+		Timeout:   timeout,
+		Proxy:     proxyURL,
+		Verbose:   verbose,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(requests)*timeout+30)*time.Second)
+	defer cancel()
+
+	for _, req := range requests {
+		_ = req
+	}
+
+	// Run each request through multi-session
+	var allResults []fuzzer.MultiResult
+	for i, req := range requests {
+		if ctx.Err() != nil {
+			break
+		}
+
+		values := []string{""}
+		multiResults, err := fuzzer.RunMulti(ctx, req, values, mgr, cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] Error on request %d: %v\n", i, err)
+			continue
+		}
+
+		if len(multiResults) > 0 {
+			allResults = append(allResults, multiResults[0])
+		}
+	}
+
+	reporter.PrintMultiTerminal(allResults)
+
+	if outputFile != "" {
+		reporter.GenerateMulti(allResults, fmt.Sprintf("HAR: %s", harFile), &reporter.Config{
+			OutputFile: outputFile,
+			Verbose:    verbose,
+		})
+		fmt.Printf("\n[+] Report saved to %s\n", outputFile)
+	}
 }

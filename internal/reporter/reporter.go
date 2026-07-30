@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/z4d3s/idorf/internal/fuzzer"
@@ -232,4 +233,82 @@ func GenerateMulti(results []fuzzer.MultiResult, target string, cfg *Config) err
 	}
 
 	return os.WriteFile(cfg.OutputFile, data, 0644)
+}
+
+// GenerateHTML creates a self-contained HTML report for multi-session results.
+func GenerateHTML(multiResults []fuzzer.MultiResult, target string, cfg *Config) error {
+	var vulnRows, safeRows string
+	vulnCount := 0
+
+	for _, r := range multiResults {
+		if r.IsVulnerable {
+			vulnCount++
+			emoji := "🔴"
+			statusClass := "warn"
+			if r.Confidence == "critical" {
+				emoji = "🚨"
+				statusClass = "critical"
+			}
+
+			var userRows string
+			for _, userName := range getSortedKeys(r.Responses) {
+				status := r.Responses[userName]
+				size := r.BodySizes[userName]
+				color := "green"
+				if status == 200 {
+					color = "red"
+				}
+				if status == 403 || status == 401 {
+					color = "green"
+				}
+				userRows += fmt.Sprintf("<tr><td>%s</td><td style='color:%s'>%d</td><td>%d</td></tr>", userName, color, status, size)
+			}
+
+			vulnRows += fmt.Sprintf(`<tr class="%s">
+				<td>%s %s</td>
+				<td>%s</td>
+				<td><table>%s</table></td>
+			</tr>`, statusClass, emoji, r.Value, r.Reason, userRows)
+		} else {
+			safeRows += fmt.Sprintf(`<tr class="safe"><td>🟢 %s</td><td colspan="2">%s</td></tr>`, r.Value, r.Reason)
+		}
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>idorf Report</title>
+<style>
+body{font-family:-apple-system,sans-serif;margin:20px;background:#0d1117;color:#c9d1d9}
+h1{color:#58a6ff}
+table{border-collapse:collapse;width:100%%;margin:10px 0}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #30363d}
+th{background:#161b22;color:#8b949e}
+.critical{background:#3d0e0e}
+.high{background:#2d1c0e}
+.warn{background:#1d2d0e}
+.safe{background:#161b22;color:#8b949e}
+.summary{font-size:1.2em;margin:20px 0}
+.count{font-weight:bold}
+.red{color:#f85149}.green{color:#3fb950}
+</style></head>
+<body>
+<h1>🔍 idorf Access Control Report</h1>
+<p>Target: %s</p>
+<div class="summary">🚨 Vulnerable: <span class="count">%d</span> | 🟢 Safe: <span class="count">%d</span> | Total: <span class="count">%d</span></div>
+<h2>Access Control Issues</h2>
+<table><tr><th>ID</th><th>Reason</th><th>Users</th></tr>%s</table>
+<h2>Safe</h2>
+<table><tr><th>ID</th><th>Reason</th><th></th></tr>%s</table>
+</body></html>`, target, vulnCount, len(multiResults)-vulnCount, len(multiResults), vulnRows, safeRows)
+
+	return os.WriteFile(cfg.OutputFile, []byte(html), 0644)
+}
+
+func getSortedKeys(m map[string]int) []string {
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
