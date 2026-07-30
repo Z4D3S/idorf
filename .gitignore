@@ -1,0 +1,27 @@
+# Binaries
+idorf
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+coverage.txt
+
+# Output
+results.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
