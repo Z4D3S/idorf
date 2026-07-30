@@ -126,8 +126,8 @@ func mutateBase64(value string, rangeSize int) []Mutation {
 
 // mutatePrefixed keeps the prefix and changes the number.
 // e.g. ORD-001 -> ORD-002, ORD-003, ORD-000
+// e.g. INV-2024-001 -> INV-2024-002, INV-2024-003, INV-2024-000
 func mutatePrefixed(value string, rangeSize int) []Mutation {
-	// Split into prefix and number
 	parts := strings.SplitN(value, "-", 2)
 	if len(parts) != 2 {
 		parts = strings.SplitN(value, "_", 2)
@@ -138,27 +138,27 @@ func mutatePrefixed(value string, rangeSize int) []Mutation {
 
 	prefix := parts[0]
 	numStr := parts[1]
+	hasYearPrefix := false
+	yearPart := ""
 
 	n, err := strconv.Atoi(numStr)
 	if err != nil {
-		// Check for YYYY-NNNN format
+		// Check for YYYY-NNNN format (e.g. "2024-002")
 		if strings.Contains(numStr, "-") {
 			subParts := strings.SplitN(numStr, "-", 2)
+			yearPart = subParts[0]
+			hasYearPrefix = true
 			n, err = strconv.Atoi(subParts[1])
 			if err != nil {
 				return nil
 			}
-			prefix = prefix + "-" + subParts[0]
+			numStr = subParts[1]
 		} else {
 			return nil
 		}
 	}
 
-	// Determine zero-padding
 	padLen := len(numStr)
-	if padLen > len(fmt.Sprintf("%d", n)) {
-		// Has leading zeros
-	}
 
 	var mutations []Mutation
 	offsets := []int{1, -1, 2, -2, 5, 10, -5, 100, -10}
@@ -166,8 +166,14 @@ func mutatePrefixed(value string, rangeSize int) []Mutation {
 		newVal := n + offset
 		if newVal > 0 {
 			formatted := fmt.Sprintf("%0*d", padLen, newVal)
+			var result string
+			if hasYearPrefix {
+				result = prefix + "-" + yearPart + "-" + formatted
+			} else {
+				result = prefix + "-" + formatted
+			}
 			mutations = append(mutations, Mutation{
-				Value:    prefix + "-" + formatted,
+				Value:    result,
 				Strategy: "prefixed",
 			})
 		}

@@ -33,8 +33,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/z4d3s/idorf/internal/detector"
+	"github.com/z4d3s/idorf/internal/diff"
 	"github.com/z4d3s/idorf/internal/fuzzer"
 	"github.com/z4d3s/idorf/internal/multisession"
+	"github.com/z4d3s/idorf/internal/mutator"
 )
 
 // Capture holds a single HTTP request captured from the proxy.
@@ -343,6 +346,152 @@ func (p *Proxy) replayCapture(captured Capture) {
 		Reason:       reason,
 	})
 	p.mu.Unlock()
+
+	// --- ID Detection + Fuzzing: find IDORs where ALL users have same access ---
+	p.fuzzIDs(captured)
+}
+
+// fuzzIDs detects IDs in the captured request and tests mutations
+// to find IDORs where ALL users have the same excessive access.
+// This catches cases the multi-user comparison misses.
+func (p *Proxy) fuzzIDs(captured Capture) {
+	// Detect IDs in the URL
+	detected := detector.Detect(captured.URL, captured.Body)
+	if len(detected.IDs) == 0 {
+		return
+	}
+
+	// Generate mutations
+	cfg := mutator.DefaultConfig()
+	mutations := mutator.MutateAll(detected.IDs, cfg)
+	if len(mutations) == 0 {
+		return
+	}
+
+	// Use the first user for ID fuzzing
+	userNames := p.cfg.Manager.GetUserNames()
+	if len(userNames) == 0 {
+		return
+	}
+	firstUser := userNames[0]
+	userSess := p.cfg.Manager.GetUserSession(firstUser)
+	if userSess == nil {
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	var baselineStatus int
+	var baselineBody string
+	var hasIDOR bool
+
+	for i, mutVal := range mutations {
+		// Build the mutated URL
+		mutatedURL := captured.URL
+		mutatedBody := captured.Body
+
+		// Replace all detected IDs with this mutation
+		for _, id := range detected.IDs {
+			mutatedURL = strings.ReplaceAll(mutatedURL, id.Value, mutVal)
+			mutatedBody = strings.ReplaceAll(mutatedBody, id.Value, mutVal)
+		}
+
+		var bodyReader io.Reader
+		if mutatedBody != "" {
+			bodyReader = strings.NewReader(mutatedBody)
+		}
+
+		req, err := http.NewRequest(captured.Method, mutatedURL, bodyReader)
+		if err != nil {
+			continue
+		}
+
+		// Set headers from capture
+		for k, v := range captured.Headers {
+			if strings.ToLower(k) == "proxy-connection" || strings.ToLower(k) == "connection" {
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+
+		// Apply user session
+		delete(req.Header, "Authorization")
+		delete(req.Header, "Cookie")
+		headerMap := make(map[string]string)
+		for k, v := range req.Header {
+			if len(v) > 0 {
+				headerMap[k] = v[0]
+			}
+		}
+		userSess.ApplyHeaders(headerMap)
+		for k, v := range headerMap {
+			req.Header.Set(k, v)
+		}
+		cookieHeader := userSess.ToCookieHeader()
+		if cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if i == 0 {
+			baselineStatus = resp.StatusCode
+			baselineBody = string(respBody)
+		}
+
+		// Check if this mutation returns different data (IDOR signal)
+		if resp.StatusCode == baselineStatus {
+			diffEngine := diff.NewEngine()
+			dr := diffEngine.Diff(baselineBody, string(respBody))
+			if dr.Score > 20 {
+				hasIDOR = true
+				if !containsIDOR(p.results, captured, mutVal) {
+					fmt.Printf("   🚨 IDOR via ID mutation: %s -> %s (diff score: %d)\n",
+						captured.URL, mutVal, dr.Score)
+				}
+			}
+		}
+	}
+
+	if hasIDOR {
+		// Check if we already have a result for this capture
+		found := false
+		p.mu.Lock()
+		for i, r := range p.results {
+			if r.Capture.URL == captured.URL && r.Capture.Method == captured.Method {
+				p.results[i].IsVulnerable = true
+				p.results[i].Confidence = "critical"
+				p.results[i].Reason = "IDOR detected via ID fuzzing (ALL users can access any ID)"
+				found = true
+				break
+			}
+		}
+		if !found {
+			p.results = append(p.results, Result{
+				Capture:      captured,
+				IsVulnerable: true,
+				Confidence:   "critical",
+				Reason:       "IDOR detected via ID fuzzing (ALL users can access any ID)",
+			})
+		}
+		p.mu.Unlock()
+	}
+}
+
+// containsIDOR checks if results already have a finding for this capture.
+func containsIDOR(results []Result, captured Capture, mutVal string) bool {
+	for _, r := range results {
+		if r.Capture.URL == captured.URL && r.Capture.Method == captured.Method {
+			if mutVal == "" || strings.Contains(r.Reason, mutVal) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PrintSummary prints the final summary of all proxy results.
