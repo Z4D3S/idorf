@@ -169,7 +169,8 @@ func sendFuzzedRequest(ctx context.Context, baseReq *parser.Request, value strin
 	bodyStr := string(bodyBytes)
 	duration := time.Since(start)
 
-	analysis := analyzer.Analyze(0, 0, resp.StatusCode, len(bodyBytes), bodyStr)
+	// Initial analysis without baseline (will be refined later)
+	analysis := analyzer.Analyze(0, 0, "", resp.StatusCode, len(bodyBytes), bodyStr, nil)
 
 	if sess != nil {
 		sess.UpdateFromResponse(resp)

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,22 +18,23 @@ import (
 )
 
 var (
-	curlCmd     string
-	requestFile string
+	curlCmd      string
+	requestFile  string
 	wordlistFile string
-	marker      string
-	sessionFile string
-	outputFile string
-	threads     int
-	rateLimit   int
-	timeout     int
-	proxyURL    string
-	verbose     bool
-	showVersion bool
-	baseline    bool
+	marker       string
+	sessionFile  string
+	outputFile   string
+	threads      int
+	rateLimit    int
+	timeout      int
+	proxyURL     string
+	diffPattern  string
+	knownIDs     string
+	verbose      bool
+	showVersion  bool
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	flag.StringVar(&curlCmd, "c", "", "cURL command to use as request template")
@@ -45,15 +47,16 @@ func main() {
 	flag.IntVar(&rateLimit, "rate-limit", 10, "Requests per second")
 	flag.IntVar(&timeout, "timeout", 10, "Request timeout in seconds")
 	flag.StringVar(&proxyURL, "proxy", "", "Proxy URL (e.g. http://127.0.0.1:8080)")
+	flag.StringVar(&diffPattern, "diff-pattern", "", "Custom regex for sensitive data detection (e.g. 'credit_card|api_key')")
+	flag.StringVar(&knownIDs, "known-ids", "", "Comma-separated IDs that are known-safe (used as baseline)")
 	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
-	flag.BoolVar(&baseline, "baseline", false, "Send first value as baseline (for comparison)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `
   _ ___ _ ___ ___
  (_) | | '_/ -_) -_)  v%s
-  _|_|_|_| \___\___|   IDOR Finder
+  _|_|_|_| \___\___|   IDOR Runner
 
 `[1:], version)
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -61,6 +64,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  idorf -r request.txt -w ids.txt        (from raw HTTP request)\n")
 		fmt.Fprintf(os.Stderr, "\nFlags:\n")
 		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  idorf -c 'curl \"http://api.x.com/users/FUZZ\"' -w ids.txt\n")
+		fmt.Fprintf(os.Stderr, "  idorf -c 'curl ...' -w ids.txt -s session.json --proxy http://127.0.0.1:8080\n")
+		fmt.Fprintf(os.Stderr, "  idorf -c 'curl ...' -w ids.txt --diff-pattern 'credit_card|ssn' --known-ids 1,2\n")
 	}
 
 	flag.Parse()
@@ -126,7 +133,31 @@ func main() {
 		fmt.Printf("[+] Session: %d cookies, %d headers\n", len(sess.Cookies), len(sess.Headers))
 	}
 
-	// 5. Configure fuzzer
+	// 5. Compile diff pattern
+	var customPattern *regexp.Regexp
+	if diffPattern != "" {
+		customPattern, err = analyzer.CompilePattern(diffPattern)
+		if err != nil {
+			fatal("compiling diff pattern: %v", err)
+		}
+		fmt.Printf("[+] Custom diff pattern: %s\n", diffPattern)
+	}
+
+	// 6. Parse known IDs
+	knownIDSet := make(map[string]bool)
+	if knownIDs != "" {
+		for _, id := range strings.Split(knownIDs, ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				knownIDSet[id] = true
+			}
+		}
+		if len(knownIDSet) > 0 {
+			fmt.Printf("[+] Known-safe IDs (baseline): %s\n", knownIDs)
+		}
+	}
+
+	// 7. Configure fuzzer
 	cfg := &fuzzer.Config{
 		Threads:   threads,
 		RateLimit: rateLimit,
@@ -141,7 +172,7 @@ func main() {
 	}
 	fmt.Println()
 
-	// 6. Run fuzzer
+	// 8. Run fuzzer
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(values)*timeout+30)*time.Second)
 	defer cancel()
 
@@ -150,29 +181,57 @@ func main() {
 		fatal("fuzzing failed: %v", err)
 	}
 
-	// 7. Calculate baseline if needed
-	baselineStatus := 0
-	baselineSize := 0
-	if len(results) > 0 {
-		baselineStatus = results[0].Status
-		baselineSize = results[0].Size
-	}
-
-	// Re-analyze with baseline
-	for i := range results {
-		if results[i].Error == "" {
-			results[i].Analysis = analyzer.Analyze(
-				baselineStatus, baselineSize,
-				results[i].Status, results[i].Size,
-				results[i].Body,
-			)
+	// 9. Build baselines from known IDs
+	var baselines []analyzer.Baseline
+	if len(knownIDSet) > 0 {
+		for _, r := range results {
+			if knownIDSet[r.Value] && r.Error == "" {
+				baselines = append(baselines, analyzer.Baseline{
+					ID:     r.Value,
+					Status: r.Status,
+					Size:   r.Size,
+					Body:   r.Body,
+				})
+			}
 		}
 	}
 
-	// 8. Report
+	// 10. Analyze results
+	if len(baselines) > 0 {
+		for i := range results {
+			if results[i].Error == "" && !knownIDSet[results[i].Value] {
+				results[i].Analysis = analyzer.AnalyzeWithBaselines(
+					results[i].Status, results[i].Size, results[i].Body,
+					baselines, customPattern,
+				)
+			} else if knownIDSet[results[i].Value] {
+				results[i].Analysis = analyzer.Result{
+					IsVulnerable: false,
+					Confidence:   "safe",
+					Reason:       "known-safe ID (baseline)",
+				}
+			}
+		}
+	} else {
+		// Use first result as baseline
+		if len(results) > 0 {
+			bl := results[0]
+			for i := range results {
+				if results[i].Error == "" {
+					results[i].Analysis = analyzer.Analyze(
+						bl.Status, bl.Size, bl.Body,
+						results[i].Status, results[i].Size, results[i].Body,
+						customPattern,
+					)
+				}
+			}
+		}
+	}
+
+	// 11. Report
 	reporter.PrintTerminal(results)
 
-	// 9. Save JSON if requested
+	// 12. Save JSON if requested
 	if outputFile != "" {
 		if err := reporter.Generate(results, req.URL, &reporter.Config{
 			OutputFile: outputFile,
@@ -183,7 +242,7 @@ func main() {
 		fmt.Printf("\n[+] Report saved to %s\n", outputFile)
 	}
 
-	// 10. Save session if it changed
+	// 13. Save session if it changed
 	if sessionFile != "" {
 		if err := sess.Save(sessionFile); err != nil {
 			fmt.Fprintf(os.Stderr, "[!] Warning: could not save session: %v\n", err)
