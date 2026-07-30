@@ -1,42 +1,19 @@
 # idorf
 
-A fast CLI tool for running IDOR (Insecure Direct Object Reference) and access control tests at scale.
+**IDOR Runner** — A CLI tool for detecting Insecure Direct Object Reference and access control vulnerabilities.
 
-`idorf` is not a magic scanner that finds bugs for you. It is a **concurrent IDOR runner** that automates the most tedious part of access control testing: replacing markers in requests, firing hundreds of authenticated requests in parallel, maintaining session state, and highlighting responses that differ from the baseline.
+`idorf` automates the most tedious part of access control testing: sending requests with different user sessions and comparing responses. It does not replace human analysis — it makes it faster.
 
-## Why
+## Features
 
-Testing IDORs manually looks like this:
-
-1. Capture a request in Burp: `GET /api/users/12345/orders`
-2. Change `12345` to `12346`
-3. Send it
-4. Compare the response with the original
-5. Repeat for `12347`, `12348`, `12349`, `12350`...
-
-This is slow. `idorf` does it in one command:
-
-```bash
-idorf -c 'curl -H "Authorization: Bearer ey..." "http://api.target.com/users/FUZZ/orders"' -w ids.txt
-```
-
-## What it does
-
-- Parses cURL commands and raw HTTP requests (Burp export)
-- Replaces a marker (`FUZZ` by default) in URL, headers, and body
-- Fires requests concurrently with rate limiting
-- Maintains session state (cookies, auth headers) across requests
-- Updates cookies from `Set-Cookie` headers automatically
-- Compares responses against a baseline to flag differences
-- Detects sensitive data patterns (email, phone, address, etc.)
-- Outputs results in terminal or JSON
-
-## What it does NOT do
-
-- It will not log in for you (yet)
-- It will not bypass WAFs or rate limits
-- It will not magically know which response is a real IDOR vs a generic 200 error
-- It does not replace human analysis — it makes it faster
+- **Multi-session mode**: send the same request with N different user tokens and compare responses side-by-side
+- **Semantic JSON diff**: detects structural changes in JSON responses (key added/removed/changed), not just size or status code
+- **Concurrent engine**: parallel requests with configurable rate limiting
+- **Session management**: auto-updates cookies from `Set-Cookie` headers
+- **Custom patterns**: regex-based sensitive data detection
+- **Known-IDs baseline**: mark your own IDs as safe to reduce false positives
+- **Flexible input**: cURL commands, raw HTTP, Burp exports, HAR files (planned)
+- **JSON export**: machine-readable output for CI/CD pipelines
 
 ## Installation
 
@@ -54,120 +31,157 @@ make build
 
 ## Usage
 
-```bash
-idorf [flags]
+### Single-session mode (fuzzing one auth context)
 
-Flags:
-  -c, --curl string        cURL command to use as request template
-  -r, --request string     File containing raw HTTP request
-  -w, --wordlist string    File with IDs/values to fuzz (one per line)
-  -m, --marker string      Marker to replace (default "FUZZ")
-  -s, --session string     Session file (cookies/tokens) for auth persistence
-  -o, --output string      Output file for JSON results (default stdout)
-  -t, --threads int        Concurrent threads (default 5)
-      --rate-limit int    Requests per second (default 10)
-      --timeout int       Request timeout in seconds (default 10)
-      --proxy string       Proxy URL (e.g. http://127.0.0.1:8080)
-      --diff-pattern string  Custom regex to detect sensitive data (default: email|phone|address|password|token|ssn)
-  --known-ids string      Comma-separated IDs that are safe (used as baseline)
-      --verbose            Verbose output
-  -v, --version           Show version
+```bash
+idorf -c 'curl "http://target.com/api/users/FUZZ/profile"' -w ids.txt
 ```
 
-## Examples
+### Multi-session mode (the killer feature)
 
-### Basic IDOR test
+Test the same endpoint with multiple users to find access control issues:
+
 ```bash
-# Wordlist of user IDs
-echo -e "12346\n12347\n12348" > ids.txt
-
-# Run idorf
-idorf -c 'curl -H "Authorization: Bearer ey..." "http://api.target.com/users/FUZZ/profile"' -w ids.txt
+idorf -c 'curl "http://target.com/api/admin/users"' \
+  --users "admin:Bearer token123,user:Bearer token456,anon:"
 ```
 
-### Use Burp proxy to inspect traffic
-```bash
-idorf -c 'curl "http://api.target.com/users/FUZZ"' -w ids.txt --proxy http://127.0.0.1:8080
+This sends the request with each user's token and compares the responses:
+
+```
+── ACCESS CONTROL DIFFERENCES ──────────────────
+🔴 [HIGH] ID: admin vs user
+   admin:    HTTP 200, 512 bytes  ← sees data
+   user:     HTTP 403, 22 bytes   ← blocked  
+   anon:     HTTP 401, 25 bytes   ← unauthenticated
+   Diff: new fields exposed (access gain), 3 other changes
 ```
 
-### Session persistence (cookies auto-updated)
+### Known-IDs baseline
+
+Mark your own account IDs as safe to reduce false positives:
+
+```bash
+idorf -c 'curl "http://target.com/api/users/FUZZ"' -w ids.txt --known-ids 1,2,3
+```
+
+### Custom sensitive data patterns
+
+```bash
+idorf -c 'curl "http://target.com/api/users/FUZZ"' -w ids.txt \
+  --diff-pattern 'credit_card|ssn|api_key'
+```
+
+### Session persistence
+
 ```bash
 # Create session file
 echo '{"cookies":[{"name":"JSESSIONID","value":"ABC123","domain":".target.com"}],
        "headers":[{"name":"Authorization","value":"Bearer ey..."}]}' > session.json
 
-# Run with session
-idorf -c 'curl "http://api.target.com/users/FUZZ/orders"' -w ids.txt -s session.json
-
-# Session is updated and saved back (new cookies from responses)
+idorf -c 'curl "http://target.com/api/users/FUZZ"' -w ids.txt -s session.json
 ```
 
-### Custom sensitive data patterns
+### Proxy debugging
+
 ```bash
-# Add your own patterns to detect in responses
-idorf -c 'curl "http://api.target.com/users/FUZZ"' -w ids.txt \
-  --diff-pattern 'credit_card|ssn|api_key|private_key'
+idorf -c 'curl "http://target.com/api/users/FUZZ"' -w ids.txt --proxy http://127.0.0.1:8080
 ```
 
-### Specify known IDs as baseline
+### JSON export
+
 ```bash
-# IDs 1 and 2 are known to be safe (your own accounts)
-idorf -c 'curl "http://api.target.com/users/FUZZ"' -w ids.txt --known-ids 1,2
+idorf -c 'curl "http://target.com/api/users/FUZZ"' -w ids.txt -o results.json
 ```
 
-### POST body IDOR
-```bash
-idorf -c 'curl -X POST -d "{\"userId\":\"FUZZ\"}" "http://api.target.com/transfer"' -w ids.txt
-```
+## Flags
 
-### Export results to JSON
-```bash
-idorf -c 'curl "http://api.target.com/users/FUZZ"' -w ids.txt -o results.json
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-c` | `""` | cURL command to use as request template |
+| `-r` | `""` | File containing raw HTTP request |
+| `-w` | `""` | Wordlist with values to fuzz (one per line) |
+| `-m` | `"FUZZ"` | Marker to replace in request |
+| `-s` | `""` | Session file (cookies/tokens) |
+| `--users` | `""` | Multi-session mode: `name:token,name:token` |
+| `--users-file` | `""` | JSON file with user sessions |
+| `-o` | `""` | Output file for JSON results |
+| `-t` | `5` | Concurrent threads |
+| `--rate-limit` | `10` | Requests per second |
+| `--timeout` | `10` | Request timeout in seconds |
+| `--proxy` | `""` | Proxy URL |
+| `--diff-pattern` | `""` | Custom regex for sensitive data |
+| `--known-ids` | `""` | Comma-separated known-safe IDs |
+| `--verbose` | `false` | Verbose output |
+| `-v` | `false` | Show version |
 
-## Session File Format
+## Users file format
 
 ```json
 {
-  "cookies": [
-    {"name": "JSESSIONID", "value": "ABC123", "domain": ".target.com"},
-    {"name": "session", "value": "XYZ789", "domain": ".target.com"}
-  ],
-  "headers": [
-    {"name": "Authorization", "value": "Bearer ey..."},
-    {"name": "X-CSRF-Token", "value": "abc123"}
+  "users": [
+    {
+      "name": "admin",
+      "headers": [{"name": "Authorization", "value": "Bearer admin-token"}]
+    },
+    {
+      "name": "user",
+      "cookies": [{"name": "session", "value": "abc123", "domain": ".target.com"}],
+      "headers": [{"name": "X-CSRF", "value": "xyz"}]
+    },
+    {
+      "name": "anon",
+      "headers": []
+    }
   ]
 }
 ```
 
-## Response Analysis
-
-idorf compares each response against a baseline (first response by default) and flags:
+## Response analysis
 
 | Status | Icon | Description |
 |--------|------|-------------|
-| CRITICAL | 🚨 | Response contains sensitive data patterns (email, phone, etc.) |
-| HIGH | 🔴 | Different status code or response size from baseline |
-| WARN | 🟡 | Same size and status as baseline (likely blocked, needs manual check) |
-| SAFE | 🟢 | HTTP 401/403 (access control working) |
+| CRITICAL | 🚨 | Semantic diff found sensitive data mismatch |
+| HIGH | 🔴 | Different status code or access level |
+| WARN | 🟡 | Same response — likely blocked or identical |
+| SAFE | 🟢 | HTTP 401/403 or matches known-safe baseline |
 | ERROR | ⚠️ | Request failed (timeout, connection error) |
+
+## Architecture
+
+```
+idorf/
+├── cmd/idorf/main.go         ← CLI entrypoint
+├── internal/
+│   ├── parser/               ← Parse cURL and raw HTTP
+│   ├── fuzzer/               ← Concurrent request engine
+│   ├── session/              ← Cookie/token management
+│   ├── analyzer/             ← Response comparison
+│   ├── diff/                 ← Semantic JSON diff engine
+│   ├── multisession/         ← Multi-user session manager
+│   └── reporter/             ← Terminal + JSON output
+├── Makefile
+├── README.md
+└── LICENSE
+```
 
 ## Roadmap
 
 - [x] cURL and raw HTTP parsing
-- [x] Concurrent request engine with rate limiting
-- [x] Session management (cookies, headers, auto-update)
-- [x] Baseline comparison analyzer
-- [x] JSON and terminal output
+- [x] Concurrent request engine
+- [x] Session management (cookies, auto-update)
+- [x] Semantic JSON diff engine
+- [x] Multi-session comparison mode
+- [x] Known-IDs baseline
 - [x] Custom diff patterns
-- [x] Known IDs baseline specification
-- [ ] Login subcommand for auth flows
-- [ ] Pipeline mode (multi-step: login -> create resource -> fuzz)
+- [ ] Auto-ID detection (int, UUID, base64, JWT)
+- [ ] Proxy mode for live traffic replay
+- [ ] ID mutation strategies
 - [ ] HAR file import
 - [ ] OpenAPI/Swagger spec import
-- [ ] Smart false-positive filtering
 - [ ] HTML report
+- [ ] CI/CD pipeline integration
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
