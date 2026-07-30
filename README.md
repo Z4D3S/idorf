@@ -1,6 +1,21 @@
 # idorf
 
-**IDOR Runner** — A CLI tool for detecting Insecure Direct Object Reference and access control vulnerabilities.
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.4.0-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/github/license/Z4D3S/idorf?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/go-%3E%3D1.21-00ADD8?style=flat-square&logo=go" alt="Go">
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square" alt="PRs">
+</p>
+
+**idorf** — IDOR Runner. A CLI tool for detecting Insecure Direct Object Reference and access control vulnerabilities.
+
+```bash
+# Proxy mode: browse normally, idorf detects access control issues automatically
+idorf --proxy-mode --users "admin:Bearer tok1,user:Bearer tok2,anon:"
+
+# Fuzzing mode: classic IDOR testing
+idorf -c 'curl "http://target.com/api/users/FUZZ"' -w ids.txt
+```
 
 `idorf` automates the most tedious part of access control testing: sending requests with different user sessions and comparing responses. It does not replace human analysis — it makes it faster.
 
