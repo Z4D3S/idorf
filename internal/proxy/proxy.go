@@ -14,11 +14,21 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -65,25 +75,40 @@ type Proxy struct {
 	captureID int
 	server    *http.Server
 	done      chan struct{}
+	caCert    *x509.Certificate
+	caKey     interface{}
+	certCache map[string]*tls.Certificate
+	certMu    sync.Mutex
 }
 
 // New creates a new proxy with the given configuration.
 func New(cfg Config) *Proxy {
-	return &Proxy{
-		cfg:  cfg,
-		done: make(chan struct{}),
+	p := &Proxy{
+		cfg:       cfg,
+		done:      make(chan struct{}),
+		certCache: make(map[string]*tls.Certificate),
 	}
+	p.initCA()
+	return p
 }
 
 // Start begins the proxy server. Blocks until the server stops.
+// Handles both HTTP and HTTPS (MITM) requests.
 func (p *Proxy) Start(ctx context.Context) error {
 	p.server = &http.Server{
-		Addr:    p.cfg.ListenAddr,
-		Handler: http.HandlerFunc(p.handleRequest),
+		Addr: p.cfg.ListenAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				p.handleConnect(w, r)
+				return
+			}
+			p.handleRequest(w, r)
+		}),
 	}
 
 	fmt.Printf("\n  idorf proxy running on http://%s\n", p.cfg.ListenAddr)
 	fmt.Printf("  Users: %d (%s)\n", p.cfg.Manager.GetUserCount(), strings.Join(p.cfg.Manager.GetUserNames(), ", "))
+	fmt.Printf("  CA cert: ~/.config/idorf/ca.crt (install in your browser)\n")
 	fmt.Printf("  Browse your target application normally.\n")
 	fmt.Printf("  Press Ctrl+C to stop and see results.\n\n")
 
@@ -353,4 +378,125 @@ func PrintSummary(results []Result) {
 			}
 		}
 	}
+}
+
+// initCA generates or loads a CA certificate for HTTPS MITM.
+func (p *Proxy) initCA() {
+	home, _ := os.UserHomeDir()
+	certDir := filepath.Join(home, ".config", "idorf")
+	os.MkdirAll(certDir, 0700)
+
+	certFile := filepath.Join(certDir, "ca.crt")
+	keyFile := filepath.Join(certDir, "ca.key")
+
+	if _, err := os.Stat(certFile); err == nil {
+		certPEM, _ := os.ReadFile(certFile)
+		keyPEM, _ := os.ReadFile(keyFile)
+		block, _ := pem.Decode(certPEM)
+		p.caCert, _ = x509.ParseCertificate(block.Bytes)
+		keyBlock, _ := pem.Decode(keyPEM)
+		p.caKey, _ = x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		return
+	}
+
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{"idorf CA"},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            1,
+	}
+
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyBytes, _ := x509.MarshalPKCS8PrivateKey(key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
+
+	os.WriteFile(certFile, certPEM, 0644)
+	os.WriteFile(keyFile, keyPEM, 0600)
+
+	p.caCert, _ = x509.ParseCertificate(certDER)
+	p.caKey = key
+
+	fmt.Printf("[+] CA cert generated: %s\n", certFile)
+}
+
+// handleConnect handles HTTPS CONNECT requests (MITM).
+func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	host, _, _ := net.SplitHostPort(r.Host)
+
+	// Generate host-specific cert
+	tlsCert := p.getOrCreateCert(host)
+
+	// Wrap the client connection with TLS
+	tlsConn := tls.Server(clientConn, &tls.Config{
+		Certificates: []tls.Certificate{*tlsCert},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		clientConn.Close()
+		return
+	}
+	defer tlsConn.Close()
+
+	// Relay traffic
+	go io.Copy(destConn, tlsConn)
+	io.Copy(tlsConn, destConn)
+}
+
+// getOrCreateCert returns a cached TLS certificate for a host or creates one.
+func (p *Proxy) getOrCreateCert(host string) *tls.Certificate {
+	p.certMu.Lock()
+	defer p.certMu.Unlock()
+
+	if cert, ok := p.certCache[host]; ok {
+		return cert
+	}
+
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: host, Organization: []string{"idorf MITM"}},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{host},
+	}
+
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, p.caCert, &key.PublicKey, p.caKey)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	tlsCert, _ := tls.X509KeyPair(certPEM, keyPEM)
+	p.certCache[host] = &tlsCert
+
+	return &tlsCert
 }

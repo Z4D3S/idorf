@@ -38,10 +38,12 @@ type Result struct {
 
 // Engine performs semantic diffs between JSON responses.
 type Engine struct {
-	SensitiveKeys []string // keys that suggest personal/sensitive data
+	SensitiveKeys   []string // keys that suggest personal/sensitive data
+	IgnoredPrefixes []string // paths to ignore (e.g. "timestamp", "nonce", "csrf")
 }
 
-// NewEngine creates a diff engine with default sensitive key patterns.
+// NewEngine creates a diff engine with default sensitive key patterns
+// and common volatile field prefixes (CSRF tokens, timestamps, etc.).
 func NewEngine() *Engine {
 	return &Engine{
 		SensitiveKeys: []string{
@@ -53,6 +55,30 @@ func NewEngine() *Engine {
 			"dob", "date_of_birth", "birthday", "national_id", "passport",
 			"balance", "iban", "account_number", "order", "transaction",
 			"role", "admin", "permissions", "is_admin", "privileges",
+		},
+		IgnoredPrefixes: []string{
+			// CSRF / tokens
+			"csrf", "_csrf", "csrf_token", "csrfmiddlewaretoken",
+			"authenticity_token", "__requestverificationtoken",
+			"nonce", "challenge",
+			// Timestamps
+			"timestamp", "_timestamp", "created_at", "updated_at",
+			"modified_at", "last_modified", "last_updated",
+			"created", "modified", "updated",
+			"date_created", "date_modified", "date_updated",
+			"expires", "expires_at", "expires_in",
+			"iat", "nbf", "exp", "jti",
+			// Session / request IDs
+			"request_id", "requestid", "trace_id", "traceid",
+			"span_id", "spanid", "correlation_id",
+			"session_id", "sessionid", "sid",
+			// Random / non-deterministic
+			"random", "rand", "seed", "uuid",
+			"non-deterministic",
+			// Pagination
+			"page", "per_page", "limit", "offset", "total",
+			"total_pages", "total_count", "total_results",
+			"current_page", "page_size", "pagecount",
 		},
 	}
 }
@@ -103,6 +129,10 @@ func (e *Engine) DiffStrings(baseline, actual string) Result {
 
 // compareValues recursively compares two parsed JSON values and collects changes.
 func (e *Engine) compareValues(path string, baseline, actual interface{}) []Change {
+	// Skip ignored paths (CSRF tokens, timestamps, etc.)
+	if e.isIgnoredPath(path) {
+		return nil
+	}
 	var changes []Change
 
 	// Type mismatch
@@ -328,10 +358,27 @@ func (e *Engine) isSensitivePath(path string) bool {
 	}
 	parts := strings.Split(path, ".")
 	for _, p := range parts {
-		// Strip array indices
 		p = strings.Split(p, "[")[0]
 		if e.isSensitiveKey(p) {
 			return true
+		}
+	}
+	return false
+}
+
+// isIgnoredPath checks if a path contains volatile fields (CSRF, timestamps, nonces).
+func (e *Engine) isIgnoredPath(path string) bool {
+	if path == "" || len(e.IgnoredPrefixes) == 0 {
+		return false
+	}
+	parts := strings.Split(path, ".")
+	for _, p := range parts {
+		p = strings.Split(p, "[")[0]
+		lower := strings.ToLower(p)
+		for _, ignored := range e.IgnoredPrefixes {
+			if lower == ignored || strings.Contains(lower, ignored) {
+				return true
+			}
 		}
 	}
 	return false
