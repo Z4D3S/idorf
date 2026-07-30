@@ -9,8 +9,8 @@ import (
 
 // Session holds authentication data for stateful fuzzing.
 type Session struct {
-	Cookies []Cookie     `json:"cookies"`
-	Headers []Header     `json:"headers"`
+	Cookies []Cookie `json:"cookies"`
+	Headers []Header `json:"headers"`
 	storage Storage
 }
 

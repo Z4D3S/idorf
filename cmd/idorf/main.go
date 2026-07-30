@@ -7,18 +7,18 @@ import (
 )
 
 var (
-	curlCmd   string
-	requestFile string
+	curlCmd      string
+	requestFile  string
 	wordlistFile string
-	marker     string
-	sessionFile string
-	outputFile string
-	threads    int
-	rateLimit  int
-	timeout    int
-	proxyURL   string
-	verbose    bool
-	showVersion bool
+	marker       string
+	sessionFile  string
+	outputFile   string
+	threads      int
+	rateLimit    int
+	timeout      int
+	proxyURL     string
+	verbose      bool
+	showVersion  bool
 )
 
 const version = "0.1.0"
